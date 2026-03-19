@@ -1,3 +1,7 @@
+"""
+Data Extractor for PDF Files
+Extracts text from PDF files and saves it in CSV format for further data processing.
+"""
 import pdfplumber
 import pandas as pd
 import os
@@ -55,7 +59,7 @@ if not pdf_files:
 else:
     logger.info(f"✅ PDF files found ({len(pdf_files)}): {pdf_files}")  
 
-# individual file processing and logging
+# ========= Main Extraction Loop =========
 for pdf_file in pdf_files:
     logger.info(f"--- Processing file: {pdf_file} ---")
     pdf_path = os.path.join(INPUT_ROOT, pdf_file)
@@ -103,3 +107,72 @@ for pdf_file in pdf_files:
         logger.error(f"❌ Error processing file {pdf_file}: {str(e)}")
 
 logger.info("--- PDF text extraction process completed ---")
+
+
+# ========= Data Cleaning =========
+# iterate over the generated CSV files and perform cleaning operations
+logger.info("--- Starting CSV cleaning process ---")
+
+# find all CSV files in subdirectories of OUTPUT_ROOT
+csv_files = []
+for root, dirs, files in os.walk(OUTPUT_ROOT):
+    for file in files:
+        if file.lower().endswith('.csv'):
+            csv_files.append(os.path.join(root, file))
+
+csv_files = sorted(csv_files)
+
+if not csv_files:
+    logger.error("❌ No CSV files found in the output directory for cleaning.")
+else:  
+    logger.info(f"✅ CSV files found for cleaning ({len(csv_files)}): {[os.path.basename(f) for f in csv_files]}")
+
+for csv_path in csv_files:
+    csv_file = os.path.basename(csv_path)
+    logger.info(f"--- Cleaning file: {csv_file} ---")
+    
+    try:
+        df = pd.read_csv(csv_path)
+        initial_count = len(df)
+
+        # 'text' column should be string and handle nulls
+        df['text'] = df['text'].astype(str).fillna('')
+
+        # remove empty lines or lines with only spaces
+        df = df[df['text'].str.strip() != ""]
+
+        # remove duplicate lines (keep only the first occurrence)
+        df = df.drop_duplicates(subset=['text'], keep='first')
+
+        # remove lines that contain *only* punctuation
+        regex_punctuation = r'^[^\w\s]+$'
+        df = df[~df['text'].str.contains(regex_punctuation, case=False, na=False)]
+
+        # remove lines that contain isolated single characters (e.g., "a", "I") that are not part of a larger word
+        regex_isolated_letters = r'^(\b[a-zA-Z]\b[\s,.()]*)+$'
+        df = df[~df['text'].str.strip().str.contains(regex_isolated_letters, na=False)]  
+
+        # remove lines that contain isolated numbers (e.g., "123", "1,000") that are not part of a larger word
+        regex_isolated_numbers = r'^[\d\s,.()]+$'
+        df = df[~df['text'].str.contains(regex_isolated_numbers, case=False, na=False)]
+
+        # remove lines with links (http, https, www)
+        regex_links = r'https?://\S+|www\.\S+'
+        df = df[~df['text'].str.contains(regex_links, case=False, na=False)]
+ 
+        # remove lines with email addresses
+        regex_emails = r'\b[\w._%+-]+@[\w.-]+\.[\w]{2,}\b'
+        df = df[~df['text'].str.contains(regex_emails, case=False, na=False)]
+
+        final_count = len(df)
+        # save the cleaned data back to a different file to preserve the original raw data
+        cleaned_file_path = csv_path.replace(".csv", "_cleaned.csv")
+        df.to_csv(cleaned_file_path, index=False, sep=",", encoding="utf-8", quoting=csv.QUOTE_ALL)
+
+        # improvements: remover o so email/url e naoo a linha toda
+        # comecar com lda simpkles
+        # analise exploratoria: wordcloud, frequencia de palavras
+        logger.info(f"✅ Cleaned {csv_file}: {initial_count} -> {final_count} lines remaining.")
+    except Exception as e:
+        logger.error(f"❌ Error cleaning file {csv_file}: {str(e)}")
+logger.info("--- CSV cleaning process completed ---")
