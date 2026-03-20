@@ -30,7 +30,7 @@ logging.basicConfig(
     format='%(asctime)s - [%(levelname)s] - %(message)s',
     handlers=[
         logging.FileHandler(LOG_FILE, encoding='utf-8'),
-        logging.StreamHandler() # Mantém o feedback visual no terminal
+        logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
@@ -169,9 +169,6 @@ for csv_path in csv_files:
         cleaned_file_path = csv_path.replace(".csv", "_cleaned.csv")
         df.to_csv(cleaned_file_path, index=False, sep=",", encoding="utf-8", quoting=csv.QUOTE_ALL)
 
-        # improvements: remover o so email/url e naoo a linha toda
-        # comecar com lda simpkles
-        # analise exploratoria: wordcloud, frequencia de palavras
         logger.info(f"✅ Cleaned {csv_file}: {initial_count} -> {final_count} lines remaining.")
     except Exception as e:
         logger.error(f"❌ Error cleaning file {csv_file}: {str(e)}")
