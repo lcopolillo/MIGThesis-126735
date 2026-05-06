@@ -5,3 +5,5 @@ logs/
 .env
 data/output/
 data/input/
+data/papers/
+docs/
