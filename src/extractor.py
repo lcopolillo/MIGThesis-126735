@@ -204,6 +204,14 @@ for csv_path in csv_files:
         # remove lines that became empty after stripping emails/URLs
         df = df[df['text'].str.strip() != ""]
 
+        # remove lines with fewer than 3 alphabetic characters (catches "uc", "ai", stray abbreviations)
+        df = df[df['text'].str.count(r'[a-zA-ZÀ-ÿ]') >= 3]
+
+        # remove table-row artifacts where digits dominate (e.g. "87523 10 C")
+        non_space_len = df['text'].str.replace(r'\s', '', regex=True).str.len()
+        alpha_count = df['text'].str.count(r'[a-zA-ZÀ-ÿ]')
+        df = df[(non_space_len == 0) | (alpha_count / non_space_len >= 0.4)]
+
         final_count = len(df)
         # save the cleaned data to a new versioned file alongside the source raw file,
         # so each cleaning run produces a new _cleaned_vN.csv and older cleaned versions are preserved
