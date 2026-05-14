@@ -40,11 +40,20 @@ CUSTOM_STOPWORDS: set[str] = {
     # author names
     'ana', 'rita', 'peixoto', 'martim', 'santos', 'santo', 'miguel', 'teodoro',
     'teresa', 'carlos', 'pedro', 'paulo', 'luis', 'rui',
+    # high-frequency generic terms that appear in every topic and dilute separation
+    'dado', 'dados',  # "data" in PT — too ubiquitous to carry topic signal
+    'data',           # "data" in EN — same issue; mixed-language slides surface both forms
     # spaCy applies PT morphology to EN words producing invalid lemmas
     'datar',     # "data" (EN) → lemmatised as PT verb "datar"
     'sciencer',  # "science" (EN) → lemmatised incorrectly
     # pt_core_news_sm lemmatisation artifacts
     'variávei',
+    'atividader',  # "atividade" lemmatised incorrectly by the small model
+    # single-slide proper nouns / brand names that carry no topic signal
+    'facebook', 'bia',
+    # English abbreviations from confusion-matrix and metric slides
+    'cat',   # confusion-matrix column header
+    'plan',  # EN word surfacing in CRISP-DM slides; not semantically stable
     # adjectives that add noise to topic distributions
     'necessário', 'novo', 'nova', 'bom', 'boa', 'grande', 'pequeno',
     'diferente', 'possível', 'geral', 'simples', 'mesmo', 'próprio',
@@ -179,6 +188,22 @@ def build_slide_page_docs(corpus: pd.DataFrame) -> pd.DataFrame:
 
     logger.info('Page-level corpus: %d documents.', len(docs))
     return docs
+
+
+def generate_topic_labels(model, num_topics: int, topn: int = 3) -> dict[int, str]:
+    """
+    Generate a label for each topic from its top-weighted terms.
+    
+    Both return (word, prob) tuples in descending weight order.
+    """
+    labels: dict[int, str] = {}
+    for i in range(num_topics):
+        if hasattr(model, 'show_topic'):
+            terms = model.show_topic(i, topn=topn)         # gensim
+        else:
+            terms = model.get_topic_words(i, top_n=topn)   # tomotopy
+        labels[i] = ' · '.join(w.capitalize() for w, _ in terms)
+    return labels
 
 
 def build_slide_deck_docs(corpus: pd.DataFrame) -> pd.DataFrame:
