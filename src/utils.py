@@ -7,6 +7,7 @@ import os
 import re
 from collections import defaultdict
 
+import numpy as np
 import pandas as pd
 import spacy
 from dotenv import load_dotenv
@@ -222,3 +223,163 @@ def build_slide_deck_docs(corpus: pd.DataFrame) -> pd.DataFrame:
     docs['n_tokens'] = docs['tokens'].apply(len)
     logger.info('Slide deck-level corpus: %d documents.', len(docs))
     return docs
+
+
+# evaluation helpers (used by lda_v1..v4 and lda_comparison_v2)
+
+def _top_words(model, topic_id: int, n: int) -> list[str]:
+    """Return the top-n words for a topic, library-agnostic via duck-typing."""
+    if hasattr(model, 'show_topic'):
+        terms = model.show_topic(topic_id, topn=n)         # gensim
+    else:
+        terms = model.get_topic_words(topic_id, top_n=n)   # tomotopy
+    return [w for w, _ in terms]
+
+
+def compute_topic_diversity(
+    model,
+    num_topics: int,
+    n: int = 25,
+    vocab_size: int | None = None,
+) -> dict:
+    """
+    Topic diversity per Dieng et al. 2020: |unique words across top-N of all topics| / (K * N).
+
+    Higher = less redundancy between topics. Range [0, 1].
+    Auto-clamps n if K*n > vocab_size to avoid an upper-bound below 1 by construction:
+    effective n = max(5, vocab_size // num_topics). Logs a warning when clamped.
+    """
+    effective_n = n
+    if vocab_size is not None and num_topics * n > vocab_size:
+        effective_n = max(5, vocab_size // num_topics)
+        logger.warning(
+            'compute_topic_diversity: K*n=%d > vocab=%d; clamping n from %d to %d',
+            num_topics * n, vocab_size, n, effective_n,
+        )
+
+    seen: set[str] = set()
+    total = 0
+    for k in range(num_topics):
+        words = _top_words(model, k, effective_n)
+        seen.update(words)
+        total += len(words)
+
+    diversity = len(seen) / total if total > 0 else 0.0
+    return {'n': effective_n, 'unique': len(seen), 'total': total, 'diversity': diversity}
+
+
+def _topic_word_matrix(model, num_topics: int) -> np.ndarray:
+    """Return the (num_topics, vocab_size) word-distribution matrix for any supported model."""
+    if hasattr(model, 'get_topics'):
+        phi = np.asarray(model.get_topics(), dtype=float)
+    else:
+        phi = np.vstack([
+            np.asarray(model.get_topic_word_dist(k), dtype=float) for k in range(num_topics)
+        ])
+    row_sums = phi.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1.0
+    return phi / row_sums
+
+
+def compute_topic_cosine_similarity(model, num_topics: int) -> dict:
+    """
+    Mean pairwise cosine similarity across topic word distributions.
+
+    For each unordered pair (i, j), i != j, compute cos(phi_i, phi_j) and average.
+    Lower values indicate more distinct topics; values close to 1 indicate redundancy.
+    Returns the mean, the per-pair matrix, and min/max for diagnosis.
+    """
+    if num_topics < 2:
+        return {'mean': 0.0, 'min': 0.0, 'max': 0.0, 'matrix': np.zeros((num_topics, num_topics))}
+
+    phi = _topic_word_matrix(model, num_topics)
+    norms = np.linalg.norm(phi, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    phi_unit = phi / norms
+    sim = phi_unit @ phi_unit.T
+
+    iu = np.triu_indices(num_topics, k=1)
+    pairs = sim[iu]
+    return {
+        'mean': float(pairs.mean()),
+        'min':  float(pairs.min()),
+        'max':  float(pairs.max()),
+        'matrix': sim,
+    }
+
+
+def compute_topic_entropy(model, num_topics: int) -> dict:
+    """
+    Per-topic Shannon entropy H(phi_z) = -sum_w phi(w) * log(phi(w)) in nats.
+
+    Low entropy: peaked, focused topic concentrated on a small set of words.
+    High entropy: diffuse distribution spread across the vocabulary.
+    Reported alongside max entropy log(V) for normalised interpretation.
+    """
+    phi = _topic_word_matrix(model, num_topics)
+    safe = np.where(phi > 0, phi, 1.0)
+    entropies = -np.sum(phi * np.log(safe), axis=1)
+    vocab_size = phi.shape[1]
+    h_max = float(np.log(vocab_size)) if vocab_size > 0 else 0.0
+    return {
+        'per_topic':   [float(h) for h in entropies],
+        'mean':        float(entropies.mean()),
+        'min':         float(entropies.min()),
+        'max':         float(entropies.max()),
+        'h_max':       h_max,
+        'mean_norm':   float(entropies.mean() / h_max) if h_max > 0 else 0.0,
+    }
+
+
+def unify_perplexity(model, bow_corpus=None) -> dict:
+    """
+    Return both raw and log perplexity on a unified scale to compare results from both libraries.
+
+    gensim and tomotopy expose perplexity differently:
+      - gensim's `lda.log_perplexity(corpus)` returns the mean log per-word probability
+        per document (a negative number); raw perplexity = exp(-log_perplexity).
+      - tomotopy's `lda.perplexity` is already raw perplexity.
+
+    The returned `log_perplexity` follows gensim's sign convention (negative = better),
+    derived from the raw value as `-log(raw)` for tomotopy. The returned `raw_perplexity`
+    is comparable across libraries (lower = better).
+    """
+    if hasattr(model, 'log_perplexity'):
+        if bow_corpus is None:
+            raise ValueError('unify_perplexity: gensim model requires bow_corpus.')
+        log_pp = float(model.log_perplexity(bow_corpus))
+        raw_pp = float(np.exp(-log_pp))
+        library = 'gensim'
+    else:
+        raw_pp = float(model.perplexity)
+        log_pp = float(-np.log(raw_pp)) if raw_pp > 0 else float('nan')
+        library = 'tomotopy'
+    return {'log_perplexity': log_pp, 'raw_perplexity': raw_pp, 'library': library}
+
+
+# def get_doc_topic_matrix(model, num_topics: int, bow_corpus=None) -> np.ndarray:
+#     """
+#     Return the (n_docs, num_topics) row-stochastic document-topic distribution.
+
+#     gensim: iterates `bow_corpus`, calls `model.get_document_topics(b, minimum_probability=0.0)`,
+#             and explicitly zero-pads to length `num_topics` (gensim occasionally drops
+#             near-zero topics even with `minimum_probability=0`, so we don't rely on it).
+#     tomotopy: stacks `np.array(d.get_topic_dist())` across `model.docs`.
+#     """
+#     if hasattr(model, 'get_document_topics'):
+#         if bow_corpus is None:
+#             raise ValueError('get_doc_topic_matrix: gensim model requires bow_corpus.')
+#         rows = []
+#         for bow in bow_corpus:
+#             row = np.zeros(num_topics, dtype=float)
+#             for tid, p in model.get_document_topics(bow, minimum_probability=0.0):
+#                 if 0 <= tid < num_topics:
+#                     row[tid] = p
+#             rows.append(row)
+#         theta = np.vstack(rows)
+#     else:
+#         theta = np.vstack([np.asarray(d.get_topic_dist(), dtype=float) for d in model.docs])
+
+#     sums = theta.sum(axis=1, keepdims=True)
+#     sums[sums == 0] = 1.0
+#     return theta / sums
