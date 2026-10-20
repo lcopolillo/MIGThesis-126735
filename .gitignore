@@ -6,4 +6,8 @@ logs/
 data/output/
 data/input/
 data/papers/
+data/delivery/
 docs/
+.agents/
+.claude/
+.serena/

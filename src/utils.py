@@ -194,7 +194,7 @@ def build_slide_page_docs(corpus: pd.DataFrame) -> pd.DataFrame:
 def generate_topic_labels(model, num_topics: int, topn: int = 3) -> dict[int, str]:
     """
     Generate a label for each topic from its top-weighted terms.
-    
+
     Both return (word, prob) tuples in descending weight order.
     """
     labels: dict[int, str] = {}
@@ -205,6 +205,212 @@ def generate_topic_labels(model, num_topics: int, topn: int = 3) -> dict[int, st
             terms = model.get_topic_words(i, top_n=topn)   # tomotopy
         labels[i] = ' · '.join(w.capitalize() for w, _ in terms)
     return labels
+
+
+IDS_COURSE_TOPICS: dict[str, str] = {
+    "ICD1": "Introdução à Ciência de Dados",
+    "ICD2": "Ética nos dados",
+    "ICD3": "Tarefas de Ciência de Dados",
+    "ICD4": "Visualização de Dados",
+    "ICD5": "Ambientação à ferramenta Orange",
+    "ICD6": "Preparação de dados",
+    "ICD7": "Modelação Supervisionada",
+    "ICD8": "Modelação Não Supervisionada",
+    "ICD9": "Dados não estruturados",
+}
+
+
+def _llm_call(message: str, system: str | None = None, timeout: int = 60,
+                thread_id: str | None = None) -> str:
+    """
+    Send one message to an OpenAI-compatible LLM proxy and return the assistant reply.
+
+    Reads credentials from the environment (.env):
+      LITELLM_BASE_URL   base URL of the proxy (e.g. https://…/v1)
+      LITELLM_API_KEY    Bearer token
+      AICORE_MODEL       model name (default: gpt-4.1-mini)
+
+    Raises on missing config or transport error so callers can fall back gracefully.
+    The `thread_id` parameter is accepted for API compatibility but unused — each
+    call is stateless (system + user message only).
+    """
+    import requests
+    import json as _json
+
+    load_dotenv(override=True)
+
+    base_url = os.getenv('LITELLM_BASE_URL', '').rstrip('/')
+    api_key  = os.getenv('LITELLM_API_KEY')
+    model    = os.getenv('AICORE_MODEL', 'gpt-4.1-mini')
+
+    missing = [name for name, val in (
+        ('LITELLM_BASE_URL', base_url), ('LITELLM_API_KEY', api_key),
+    ) if not val]
+    if missing:
+        raise RuntimeError(
+            f"LLM proxy config missing from environment/.env: {', '.join(missing)}"
+        )
+
+    messages = []
+    if system:
+        messages.append({'role': 'system', 'content': system})
+    messages.append({'role': 'user', 'content': message})
+
+    headers = {
+        'Authorization': f'Bearer {api_key}',
+        'Content-Type':  'application/json',
+    }
+    payload = {'model': model, 'messages': messages, 'max_tokens': 200}
+
+    resp = requests.post(
+        f'{base_url}/chat/completions',
+        headers=headers,
+        json=payload,
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data['choices'][0]['message']['content'].strip()
+
+
+def generate_topic_labels_llm(
+    model,
+    num_topics: int,
+    topn: int = 10,
+    context: str = "Introduction to Data Science university course slides",
+    use_course_topics: bool = True,
+    course_topics: dict[str, str] | None = IDS_COURSE_TOPICS,
+    topic_ids: list[int] | None = None,
+) -> dict[int, str]:
+    """
+    Generate a concise 2-4 word topic label for each topic using the iaedu LLM agent.
+
+    Calls the iaedu agent once per topic, passing the top-N words as input.
+    Returns the same dict[int, str] shape as generate_topic_labels() so it
+    is a drop-in replacement for axis labels and legends.
+
+    Requires the IAEDU_* variables in the environment (or .env file).
+    Falls back to the keyword-join label on any API error.
+
+    Args:
+        model:              Trained gensim or tomotopy LDA model.
+        num_topics:         Number of topics in the model (used when topic_ids is None).
+        topn:               Number of top words sent to the LLM per topic.
+        context:            One-line description of the corpus, included in the prompt.
+        use_course_topics:  When True (few-shot), anchor labels to the known
+                            curriculum via `course_topics`. When False (zero-shot),
+                            labels are derived from the topic keywords alone.
+        course_topics:      Mapping of course unit codes to titles used as anchors
+                            in few-shot mode. Ignored when use_course_topics is False.
+        topic_ids:          Optional explicit list of topic ids to label. For sparse
+                            models (e.g. hLDA live topics), pass this to skip dead
+                            topics and avoid wasted API calls. Defaults to
+                            range(num_topics).
+    """
+    ids = topic_ids if topic_ids is not None else range(num_topics)
+    curriculum_block = ""
+    if use_course_topics and course_topics:
+        lines = "\n".join(f"  {code}: {title}" for code, title in course_topics.items())
+        curriculum_block = (
+            f"\nThe course covers the following units — use these as semantic anchors "
+            f"when the keywords clearly align, but do not force a match:\n{lines}\n"
+        )
+
+    system_prompt = (
+        f"You are a topic-modelling assistant. "
+        f"The corpus consists of {context}. "
+        f"{curriculum_block}"
+        "Given a list of keywords from a topic model, respond with a concise label "
+        "of 2–4 words that captures the theme. "
+        "Reply with the label only — no punctuation, no explanation."
+    )
+
+    labels: dict[int, str] = {}
+    for i in ids:
+        if hasattr(model, 'show_topic'):
+            terms = model.show_topic(i, topn=topn)
+        else:
+            terms = model.get_topic_words(i, top_n=topn)
+        keywords = ', '.join(w for w, _ in terms)
+
+        try:
+            label = _llm_call(f"Keywords: {keywords}", system=system_prompt)
+            if not label:
+                raise ValueError("empty response from iaedu agent")
+        except Exception as exc:
+            logger.warning("LLM label failed for topic %d (%s); using keyword fallback.", i, exc)
+            label = ' · '.join(w.capitalize() for w, _ in terms[:3])
+
+        labels[i] = label
+        logger.debug("Topic %d → %r", i, label)
+
+    return labels
+
+
+def align_topics_to_units(
+    model,
+    num_topics: int,
+    labels: dict[int, str] | None = None,
+    topn: int = 10,
+    course_topics: dict[str, str] = IDS_COURSE_TOPICS,
+    topic_ids: list[int] | None = None,
+) -> dict[int, dict]:
+    """
+    Classify each topic to the IDS course unit (ICD1–ICD9) it best matches.
+
+    Asks the iaedu agent, per topic, which unit the topic's keywords (and optional
+    label) correspond to, restricting the answer to a unit code or NONE. Used to
+    measure whether the discovered topics recover the real curriculum structure,
+    and to compare zero-shot vs few-shot label alignment.
+
+    Args:
+        model:          Trained gensim or tomotopy model.
+        num_topics:     Number of topics to classify (used when topic_ids is None).
+        labels:         Optional {topic_id: label} to include as extra context.
+        topn:           Number of top words sent to the agent per topic.
+        course_topics:  Unit code → title mapping the topic is aligned against.
+        topic_ids:      Optional explicit list of topic ids (e.g. hLDA live topics)
+                        to skip dead topics. Defaults to range(num_topics).
+
+    Returns:
+        {topic_id: {'unit': 'ICD4'|None, 'unit_title': str|None}}
+    """
+    ids = topic_ids if topic_ids is not None else range(num_topics)
+    unit_lines = "\n".join(f"  {code}: {title}" for code, title in course_topics.items())
+    valid_codes = set(course_topics)
+    system_prompt = (
+        "You are a topic-modelling assistant for an Introduction to Data Science "
+        "university course. Given the keywords of a topic, decide which single course "
+        f"unit it best corresponds to. The units are:\n{unit_lines}\n"
+        "Reply with the unit code only (e.g. ICD4), or NONE if no unit clearly matches. "
+        "No explanation."
+    )
+
+    alignment: dict[int, dict] = {}
+    for i in ids:
+        if hasattr(model, 'show_topic'):
+            terms = model.show_topic(i, topn=topn)
+        else:
+            terms = model.get_topic_words(i, top_n=topn)
+        keywords = ', '.join(w for w, _ in terms)
+        label_hint = f" (candidate label: {labels[i]})" if labels and i in labels else ""
+
+        unit = None
+        try:
+            reply = _llm_call(f"Keywords: {keywords}{label_hint}", system=system_prompt)
+            match = re.search(r'ICD[1-9]', reply.upper())
+            if match and match.group(0) in valid_codes:
+                unit = match.group(0)
+        except Exception as exc:
+            logger.warning("Unit alignment failed for topic %d (%s).", i, exc)
+
+        alignment[i] = {
+            'unit':       unit,
+            'unit_title': course_topics.get(unit) if unit else None,
+        }
+        logger.debug("Topic %d → unit %r", i, unit)
+
+    return alignment
 
 
 def build_slide_deck_docs(corpus: pd.DataFrame) -> pd.DataFrame:
@@ -357,29 +563,140 @@ def unify_perplexity(model, bow_corpus=None) -> dict:
     return {'log_perplexity': log_pp, 'raw_perplexity': raw_pp, 'library': library}
 
 
-# def get_doc_topic_matrix(model, num_topics: int, bow_corpus=None) -> np.ndarray:
-#     """
-#     Return the (n_docs, num_topics) row-stochastic document-topic distribution.
+def compute_holdout_perplexity(
+    model,
+    test_texts: list,
+    infer_iter: int = 100,
+) -> dict:
+    """
+    Compute holdout perplexity on unseen documents via model.make_doc() + model.infer().
 
-#     gensim: iterates `bow_corpus`, calls `model.get_document_topics(b, minimum_probability=0.0)`,
-#             and explicitly zero-pads to length `num_topics` (gensim occasionally drops
-#             near-zero topics even with `minimum_probability=0`, so we don't rely on it).
-#     tomotopy: stacks `np.array(d.get_topic_dist())` across `model.docs`.
-#     """
-#     if hasattr(model, 'get_document_topics'):
-#         if bow_corpus is None:
-#             raise ValueError('get_doc_topic_matrix: gensim model requires bow_corpus.')
-#         rows = []
-#         for bow in bow_corpus:
-#             row = np.zeros(num_topics, dtype=float)
-#             for tid, p in model.get_document_topics(bow, minimum_probability=0.0):
-#                 if 0 <= tid < num_topics:
-#                     row[tid] = p
-#             rows.append(row)
-#         theta = np.vstack(rows)
-#     else:
-#         theta = np.vstack([np.asarray(d.get_topic_dist(), dtype=float) for d in model.docs])
+    Documents are created without updating model parameters (read-only inference).
+    Returns the same {raw_perplexity, log_perplexity} schema as unify_perplexity(),
+    plus n_docs, n_words, and total_log_likelihood for transparency.
 
-#     sums = theta.sum(axis=1, keepdims=True)
-#     sums[sums == 0] = 1.0
-#     return theta / sums
+    Only supports tomotopy models (LDAModel, HLDAModel).
+
+    Denominator: len(doc.words) summed over all test docs — the number of tokens
+    actually presented to infer(). make_doc() silently drops tokens that are
+    completely unknown to the model (not in vocabs at all), so using the raw
+    input token count would inflate the denominator and deflate perplexity.
+    """
+    if not test_texts:
+        return {
+            'raw_perplexity': float('nan'), 'log_perplexity': float('nan'),
+            'n_docs': 0, 'n_words': 0, 'total_log_likelihood': float('nan'),
+        }
+
+    test_docs = [model.make_doc(tokens) for tokens in test_texts]
+    # infer() returns (topic_dists, list[log_likelihood_per_doc])
+    _, log_likelihoods = model.infer(test_docs, iterations=infer_iter, workers=1)
+    total_ll = sum(log_likelihoods)
+
+    # Use the number of words actually presented to infer(), not the raw input
+    # token count — make_doc() drops tokens unknown to the model entirely.
+    total_words = sum(len(doc.words) for doc in test_docs)
+    if total_words == 0:
+        return {
+            'raw_perplexity': float('nan'), 'log_perplexity': float('nan'),
+            'n_docs': len(test_docs), 'n_words': 0,
+            'total_log_likelihood': float(total_ll),
+        }
+
+    # log_perplexity follows gensim sign convention: negative = better
+    log_pp = float(total_ll) / total_words   # negative (mean log-prob per word)
+    raw_pp = float(np.exp(-log_pp))          # > 1, lower is better
+    return {
+        'raw_perplexity':       raw_pp,
+        'log_perplexity':       log_pp,
+        'n_docs':               len(test_docs),
+        'n_words':              total_words,
+        'total_log_likelihood': float(total_ll),
+    }
+
+
+def compute_holdout_perplexity_gensim(model, test_bow: list) -> dict:
+    """
+    Holdout perplexity for gensim LDA models.
+
+    gensim's log_perplexity() uses the variational lower bound which is unreliable
+    on out-of-sample data. This function infers per-document topic distributions
+    (theta) on the test BoW, then scores each token as P(w|theta,phi) = sum_k theta_k * phi_kw,
+    matching the conditional estimator used by compute_holdout_perplexity() for tomotopy.
+
+    Returns the same schema as compute_holdout_perplexity().
+    """
+    if not test_bow:
+        return {
+            'raw_perplexity': float('nan'), 'log_perplexity': float('nan'),
+            'n_docs': 0, 'n_words': 0, 'total_log_likelihood': float('nan'),
+        }
+
+    phi = model.get_topics()  # shape (K, V)
+    total_ll = 0.0
+    total_words = 0
+
+    for doc_bow in test_bow:
+        if not doc_bow:
+            continue
+        theta, _ = model.inference([doc_bow])
+        theta = theta[0]
+        s = theta.sum()
+        if s > 0:
+            theta = theta / s
+        for word_id, count in doc_bow:
+            pw = float(np.dot(theta, phi[:, word_id]))
+            if pw > 0:
+                total_ll += count * np.log(pw)
+        total_words += sum(cnt for _, cnt in doc_bow)
+
+    if total_words == 0:
+        return {
+            'raw_perplexity': float('nan'), 'log_perplexity': float('nan'),
+            'n_docs': len(test_bow), 'n_words': 0,
+            'total_log_likelihood': float(total_ll),
+        }
+
+    log_pp = total_ll / total_words   # negative (mean log-prob per word)
+    raw_pp = float(np.exp(-log_pp))
+    return {
+        'raw_perplexity':       raw_pp,
+        'log_perplexity':       log_pp,
+        'n_docs':               len(test_bow),
+        'n_words':              total_words,
+        'total_log_likelihood': float(total_ll),
+    }
+
+
+def compute_topic_exclusivity(model, num_topics: int, n: int = 10) -> dict:
+    """
+    Topic exclusivity: how concentrated a topic's top words are in that topic alone.
+
+    For the top-n words of each topic, averages P(topic | word) — obtained by
+    column-normalising the topic-word matrix so each word's mass sums to 1 across
+    topics. A score near 1 means the topic's leading words rarely appear in other
+    topics (highly exclusive); a low score means they are shared vocabulary.
+
+    Complements coherence (which measures within-topic word relatedness) with a
+    between-topic distinctiveness view. Range [0, 1].
+
+    Returns {'per_topic': {tid: score}, 'mean', 'min', 'max', 'n'}.
+    """
+    phi = _topic_word_matrix(model, num_topics)          # (K, V), rows sum to 1
+    col_sums = phi.sum(axis=0, keepdims=True)             # per-word mass across topics
+    col_sums[col_sums == 0] = 1.0
+    p_topic_given_word = phi / col_sums                  # (K, V) = P(topic | word)
+
+    per_topic: dict[int, float] = {}
+    for k in range(num_topics):
+        top_idx = np.argsort(phi[k])[::-1][:n]
+        per_topic[k] = float(p_topic_given_word[k, top_idx].mean())
+
+    scores = np.array(list(per_topic.values()), dtype=float)
+    return {
+        'per_topic': per_topic,
+        'mean': float(scores.mean()) if scores.size else 0.0,
+        'min':  float(scores.min())  if scores.size else 0.0,
+        'max':  float(scores.max())  if scores.size else 0.0,
+        'n': n,
+    }
