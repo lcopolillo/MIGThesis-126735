@@ -273,13 +273,13 @@ def generate_topic_labels_llm(
     topic_ids: list[int] | None = None,
 ) -> dict[int, str]:
     """
-    Generate a concise 2-4 word topic label for each topic using the iaedu LLM agent.
+    Generate a concise 2-4 word topic label for each topic using the LLM agent.
 
-    Calls the iaedu agent once per topic, passing the top-N words as input.
+    Calls the LLM once per topic, passing the top-N words as input.
     Returns the same dict[int, str] shape as generate_topic_labels() so it
     is a drop-in replacement for axis labels and legends.
 
-    Requires the IAEDU_* variables in the environment (or .env file).
+    Requires the LITELLM_* variables in the environment (or .env file).
     Falls back to the keyword-join label on any API error.
 
     Args:
@@ -326,9 +326,9 @@ def generate_topic_labels_llm(
         try:
             label = _llm_call(f"Keywords: {keywords}", system=system_prompt)
             if not label:
-                raise ValueError("empty response from iaedu agent")
+                raise ValueError("empty response from LLM")
         except Exception as exc:
-            logger.warning("LLM label failed for topic %d (%s); using keyword fallback.", i, exc)
+            logger.warning("LLM call failed for topic %d (%s); using keyword fallback.", i, exc)
             label = ' · '.join(w.capitalize() for w, _ in terms[:3])
 
         labels[i] = label
@@ -348,7 +348,7 @@ def align_topics_to_units(
     """
     Classify each topic to the IDS course unit (ICD1–ICD9) it best matches.
 
-    Asks the iaedu agent, per topic, which unit the topic's keywords (and optional
+    Asks the LLM, per topic, which unit the topic's keywords (and optional
     label) correspond to, restricting the answer to a unit code or NONE. Used to
     measure whether the discovered topics recover the real curriculum structure,
     and to compare zero-shot vs few-shot label alignment.
